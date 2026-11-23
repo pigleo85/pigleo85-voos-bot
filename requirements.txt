@@ -1,0 +1,7 @@
+flask
+requests
+google-genai
+gspread
+google-auth
+pydantic
+pillow
