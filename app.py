@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import requests
 from flask import Flask, request, jsonify
@@ -11,11 +12,24 @@ from google.genai.errors import APIError
 
 app = Flask(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+def _limpar_token(token_bruto):
+    if not token_bruto:
+        return ""
+    texto = str(token_bruto).strip()
+    texto = re.sub(r"\[.*?\]\(.*?\)", "", texto)
+    texto = texto.replace("https://api.telegram.org/bot", "").replace("http://api.telegram.org/bot", "")
+    texto = texto.replace("https://api.telegram.org/file/bot", "").replace("http://api.telegram.org/file/bot", "")
+    texto = texto.strip("[]()\"' \n\r\t/")
+    match = re.search(r"\d+:[A-Za-z0-9_-]+", texto)
+    return match.group(0) if match else texto
+
+
+TELEGRAM_TOKEN = _limpar_token(os.environ.get("TELEGRAM_TOKEN", ""))
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY", "") or "").strip().strip('"').strip("'")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-SHEET_NAME = os.environ.get("SHEET_NAME", "Voos Embarque x Desembarque")
-ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
+SHEET_NAME = (os.environ.get("SHEET_NAME", "Voos Embarque x Desembarque") or "Voos Embarque x Desembarque").strip()
+ALLOWED_CHAT_ID = (os.environ.get("ALLOWED_CHAT_ID", "") or "").strip()
 
 MODELOS_GEMINI = [
     "gemini-3.8-flash",
@@ -26,7 +40,7 @@ client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else genai.Clien
 
 
 def enviar_mensagem(chat_id, texto):
-    if not TELEGRAM_TOKEN:
+    if not TELEGRAM_TOKEN or not chat_id:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -112,9 +126,13 @@ def registrar_na_planilha(dados):
 
 
 def baixar_arquivo_telegram(file_id):
-    info_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/getFile?file_id={file_id}"
-    info_resp = requests.get(info_url, timeout=20).json()
-    file_path = info_resp["result"]["file_path"]
+    if not TELEGRAM_TOKEN:
+        raise ValueError("TELEGRAM_TOKEN inválido ou vazio após limpeza.")
+    info_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/getFile"
+    info_resp = requests.get(info_url, params={"file_id": file_id}, timeout=20)
+    info_resp.raise_for_status()
+    info_json = info_resp.json()
+    file_path = info_json["result"]["file_path"].lstrip("/")
     file_url = f"[https://api.telegram.org/file/bot](https://api.telegram.org/file/bot){TELEGRAM_TOKEN}/{file_path}"
     file_resp = requests.get(file_url, timeout=30)
     file_resp.raise_for_status()
