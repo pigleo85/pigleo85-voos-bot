@@ -62,6 +62,27 @@ def obter_planilha():
     return gc.open(SHEET_NAME)
 
 
+def _extrair_retry_delay(msg):
+    match = re.search(r"retry in ([0-9.]+)s", msg, re.IGNORECASE)
+    if match:
+        try:
+            segundos = float(match.group(1))
+            horas = int(segundos // 3600)
+            minutos = int((segundos % 3600) // 60)
+            if horas > 0:
+                return f"{horas}h {minutos}min"
+            if minutos > 0:
+                return f"{minutos}min"
+            return f"{int(segundos)}s"
+        except ValueError:
+            pass
+    return None
+
+
+class QuotaExcedidaError(Exception):
+    pass
+
+
 def extrair_dados_comprovante(file_bytes, mime_type):
     prompt = (
         "Analise este comprovante ou passagem aérea e extraia os dados do voo em JSON puro, "
@@ -76,7 +97,7 @@ def extrair_dados_comprovante(file_bytes, mime_type):
     ultimo_erro = None
 
     for modelo in MODELOS_GEMINI:
-        for tentativa in range(5):
+        for tentativa in range(4):
             try:
                 response = client.models.generate_content(
                     model=modelo,
@@ -91,9 +112,18 @@ def extrair_dados_comprovante(file_bytes, mime_type):
             except APIError as e:
                 ultimo_erro = e
                 msg = str(e)
-                if getattr(e, "code", None) == 503 or "503" in msg or "UNAVAILABLE" in msg:
+                codigo = getattr(e, "code", None)
+                if codigo == 429 or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    tempo_espera = _extrair_retry_delay(msg)
+                    aviso = "Quota da API Gemini atingida (429 RESOURCE_EXHAUSTED)."
+                    if tempo_espera:
+                        aviso += f" Aguarde cerca de {tempo_espera} para nova tentativa."
+                    raise QuotaExcedidaError(aviso)
+                if codigo == 503 or "503" in msg or "UNAVAILABLE" in msg:
                     time.sleep(3 * (tentativa + 1))
                     continue
+                raise
+            except QuotaExcedidaError:
                 raise
             except Exception as e:
                 ultimo_erro = e
@@ -179,6 +209,8 @@ def webhook():
             f"Voo: {dados.get('companhia', '-')} {dados.get('numero_voo', '')}"
         )
         enviar_mensagem(chat_id, resumo)
+    except QuotaExcedidaError as e:
+        enviar_mensagem(chat_id, f"⚠️ {e}")
     except Exception as e:
         enviar_mensagem(chat_id, f"❌ Erro ao processar print: {e}")
 
