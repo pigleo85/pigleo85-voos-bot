@@ -12,17 +12,14 @@ from google.genai.errors import APIError
 
 app = Flask(__name__)
 
+TELEGRAM_API_BASE = "https:" + "//api.telegram.org"
+
 
 def _limpar_token(token_bruto):
     if not token_bruto:
         return ""
-    texto = str(token_bruto).strip()
-    texto = re.sub(r"\[.*?\]\(.*?\)", "", texto)
-    texto = texto.replace("https://api.telegram.org/bot", "").replace("http://api.telegram.org/bot", "")
-    texto = texto.replace("https://api.telegram.org/file/bot", "").replace("http://api.telegram.org/file/bot", "")
-    texto = texto.strip("[]()\"' \n\r\t/")
-    match = re.search(r"\d+:[A-Za-z0-9_-]+", texto)
-    return match.group(0) if match else texto
+    match = re.search(r"\d+:[A-Za-z0-9_-]+", str(token_bruto))
+    return match.group(0) if match else str(token_bruto).strip()
 
 
 TELEGRAM_TOKEN = _limpar_token(os.environ.get("TELEGRAM_TOKEN", ""))
@@ -42,7 +39,7 @@ client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else genai.Clien
 def enviar_mensagem(chat_id, texto):
     if not TELEGRAM_TOKEN or not chat_id:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": texto,
@@ -58,8 +55,8 @@ def obter_planilha():
         raise ValueError("Variável GOOGLE_CREDENTIALS_JSON não configurada.")
     creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
     scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+        "https:" + "//www.googleapis.com/auth/spreadsheets",
+        "https:" + "//www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
     gc = gspread.authorize(creds)
@@ -127,13 +124,13 @@ def registrar_na_planilha(dados):
 
 def baixar_arquivo_telegram(file_id):
     if not TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_TOKEN inválido ou vazio após limpeza.")
-    info_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/getFile"
+        raise ValueError("TELEGRAM_TOKEN inválido ou vazio.")
+    info_url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}/getFile"
     info_resp = requests.get(info_url, params={"file_id": file_id}, timeout=20)
     info_resp.raise_for_status()
     info_json = info_resp.json()
     file_path = info_json["result"]["file_path"].lstrip("/")
-    file_url = f"[https://api.telegram.org/file/bot](https://api.telegram.org/file/bot){TELEGRAM_TOKEN}/{file_path}"
+    file_url = f"{TELEGRAM_API_BASE}/file/bot{TELEGRAM_TOKEN}/{file_path}"
     file_resp = requests.get(file_url, timeout=30)
     file_resp.raise_for_status()
     return file_resp.content, file_path
