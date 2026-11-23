@@ -1,198 +1,175 @@
-import os
 import json
-import io
+import os
+import time
 import requests
-from flask import Flask, request
-from PIL import Image
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field
+from flask import Flask, request, jsonify
 import gspread
 from google.oauth2.service_account import Credentials
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
 
 app = Flask(__name__)
 
-# Variáveis de Ambiente
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+SHEET_NAME = os.environ.get("SHEET_NAME", "Voos Embarque x Desembarque")
+ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
 
-SPREADSHEET_NAME = "Voos Embarque x Desembarque"
+MODELOS_GEMINI = [
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+]
 
-class TrechoVoo(BaseModel):
-    data_voo: str = Field(description="Data do voo no formato DD/MM/AAAA")
-    trajeto: str = Field(description="Origem e destino IATA, ex: GIG x VIX ou VIX x GIG")
-    cia: str = Field(description="Companhia aérea em maiúsculo, ex: GOL, LATAM, AZUL")
-    horario_partida: str = Field(description="Horário de partida HH:MM, ex: 19:15")
-    localizador: str = Field(description="Código localizador de 6 caracteres, ex: ELRBTE")
-    preco_total: float = Field(description="Valor total pago em reais incluindo taxas, ex: 247.01")
-    obs: str = Field(description="Quantidade de milhas se resgatado com pontos (ex: '10600 milhas'), ou string vazia ''")
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else genai.Client()
 
-class ComprovantePassagem(BaseModel):
-    voos: list[TrechoVoo]
 
-def get_sheets_client():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+def enviar_mensagem(chat_id, texto):
+    if not TELEGRAM_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": texto,
+    }
+    try:
+        requests.post(url, json=payload, timeout=20)
+    except Exception:
+        pass
+
+
+def obter_planilha():
+    if not GOOGLE_CREDENTIALS_JSON:
+        raise ValueError("Variável GOOGLE_CREDENTIALS_JSON não configurada.")
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    return gspread.authorize(creds)
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc.open(SHEET_NAME)
 
-def send_telegram_message(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-
-def baixar_arquivo_telegram(file_id):
-    file_info = requests.get(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
-    ).json()
-    file_path = file_info["result"]["file_path"]
-    return requests.get(
-        f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-    ).content
 
 def extrair_dados_comprovante(file_bytes, mime_type):
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
-    if mime_type == "application/pdf":
-        conteudo_midia = types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
-    else:
-        conteudo_midia = Image.open(io.BytesIO(file_bytes))
-
     prompt = (
-        "Analise este comprovante de compra de passagem aérea (imagem ou PDF). "
-        "Extraia todos os trechos de voo presentes no documento. "
-        "Atenção: pegue a DATA DO VOO (embarque), nunca a data da compra/emissão. "
-        "Se houver ida e volta no mesmo comprovante e apenas um valor total pago, "
-        "coloque o valor total no primeiro trecho e 0.0 no segundo."
+        "Analise este comprovante ou passagem aérea e extraia os dados do voo em JSON puro, "
+        "sem blocos markdown, com as chaves: "
+        '{"companhia": "", "numero_voo": "", "origem": "", "destino": "", '
+        '"data_embarque": "", "hora_embarque": "", "data_chegada": "", "hora_chegada": "", '
+        '"localizador": "", "passageiro": ""}. '
+        "Se algum campo não existir, use string vazia."
     )
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=[conteudo_midia, prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ComprovantePassagem,
-            temperature=0.1,
-        ),
-    )
-    return json.loads(response.text)
+    parte_arquivo = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+    ultimo_erro = None
 
-def atualizar_planilha(voos):
-    gc = get_sheets_client()
-    sh = gc.open(SPREADSHEET_NAME)
-    resultados = []
-
-    for voo in voos:
-        data_alvo = voo["data_voo"].strip()
-        ano = data_alvo.split("/")[-1]
-
-        abas_para_buscar = [ano]
-        if ano == "2028":
-            abas_para_buscar.append("2027")
-
-        encontrado = False
-        for nome_aba in abas_para_buscar:
+    for modelo in MODELOS_GEMINI:
+        for tentativa in range(3):
             try:
-                ws = sh.worksheet(nome_aba)
-            except gspread.WorksheetNotFound:
-                continue
-
-            datas_coluna = ws.col_values(1)  # Coluna A = Data
-
-            linha_escolhida = None
-            for idx, val in enumerate(datas_coluna, start=1):
-                if val.strip() == data_alvo:
-                    status_atual = ws.cell(idx, 2).value or ""
-                    linha_escolhida = idx
-                    if status_atual.strip().lower() == "pendente":
-                        break
-
-            if linha_escolhida:
-                preco_formatado = (
-                    f"R$ {voo['preco_total']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                    if voo["preco_total"] > 0
-                    else ""
+                response = client.models.generate_content(
+                    model=modelo,
+                    contents=[parte_arquivo, prompt],
                 )
+                texto = (response.text or "").strip()
+                if texto.startswith("```"):
+                    linhas = texto.splitlines()
+                    if len(linhas) >= 3:
+                        texto = "\n".join(linhas[1:-1]).strip()
+                return json.loads(texto), modelo
+            except APIError as e:
+                ultimo_erro = e
+                msg = str(e)
+                if getattr(e, "code", None) == 503 or "503" in msg or "UNAVAILABLE" in msg:
+                    time.sleep(2 * (tentativa + 1))
+                    continue
+                raise
+            except Exception as e:
+                ultimo_erro = e
+                time.sleep(1)
 
-                ws.update(
-                    range_name=f"B{linha_escolhida}:H{linha_escolhida}",
-                    values=[[
-                        "Comprada",
-                        voo["trajeto"],
-                        voo["cia"],
-                        voo["horario_partida"],
-                        voo["localizador"].upper(),
-                        preco_formatado,
-                        voo["obs"]
-                    ]],
-                    value_input_option="USER_ENTERED"
-                )
-                resultados.append(
-                    f"✅ *Aba {nome_aba} (Linha {linha_escolhida}) atualizada!*\n"
-                    f"📅 *Data:* {data_alvo} ({voo['trajeto']})\n"
-                    f"✈️ *Voo:* {voo['cia']} às {voo['horario_partida']} | *Loc:* `{voo['localizador'].upper()}`\n"
-                    f"💰 *Valor:* {preco_formatado or 'Incluso na ida'}"
-                )
-                encontrado = True
-                break
+    raise ultimo_erro if ultimo_erro else RuntimeError("Falha ao consultar o Gemini.")
 
-        if not encontrado:
-            resultados.append(f"⚠️ Data *{data_alvo}* não encontrada na planilha. Nenhuma linha alterada.")
 
-    return "\n\n".join(resultados)
+def registrar_na_planilha(dados):
+    planilha = obter_planilha()
+    aba = planilha.sheet1
+    linha = [
+        dados.get("data_embarque", ""),
+        dados.get("hora_embarque", ""),
+        dados.get("origem", ""),
+        dados.get("destino", ""),
+        dados.get("companhia", ""),
+        dados.get("numero_voo", ""),
+        dados.get("localizador", ""),
+        dados.get("passageiro", ""),
+        dados.get("data_chegada", ""),
+        dados.get("hora_chegada", ""),
+    ]
+    aba.append_row(linha, value_input_option="USER_ENTERED")
+    return aba.title, len(aba.get_all_values())
 
-@app.route("/", methods=["GET"])
-def health():
+
+def baixar_arquivo_telegram(file_id):
+    info_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/getFile?file_id={file_id}"
+    info_resp = requests.get(info_url, timeout=20).json()
+    file_path = info_resp["result"]["file_path"]
+    file_url = f"[https://api.telegram.org/file/bot](https://api.telegram.org/file/bot){TELEGRAM_TOKEN}/{file_path}"
+    file_resp = requests.get(file_url, timeout=30)
+    file_resp.raise_for_status()
+    return file_resp.content, file_path
+
+
+@app.route("/", methods=["GET", "HEAD"])
+def home():
     return "Bot de Voos ativo!", 200
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
-    if not data or "message" not in data:
-        return "OK", 200
+    data = request.get_json(silent=True) or {}
+    mensagem = data.get("message") or data.get("edited_message")
+    if not mensagem:
+        return jsonify({"ok": True}), 200
 
-    msg = data["message"]
-    chat_id = str(msg["chat"]["id"])
+    chat_id = str(mensagem.get("chat", {}).get("id", ""))
+    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+        return jsonify({"ok": True}), 200
 
-    if ALLOWED_CHAT_ID and chat_id != str(ALLOWED_CHAT_ID):
-        return "Unauthorized", 200
+    file_id = None
+    mime_type = None
 
-    # Caso 1: Print enviado como foto
-    if "photo" in msg:
-        send_telegram_message(chat_id, "⏳ Lendo print da passagem...")
-        try:
-            file_id = msg["photo"][-1]["file_id"]
-            file_bytes = baixar_arquivo_telegram(file_id)
-            dados = extrair_dados_comprovante(file_bytes, "image/jpeg")
-            resposta = atualizar_planilha(dados.get("voos", []))
-            send_telegram_message(chat_id, resposta)
-        except Exception as e:
-            send_telegram_message(chat_id, f"❌ Erro ao processar print: `{str(e)}`")
-
-    # Caso 2: Arquivo PDF ou imagem enviada sem compressão
-    elif "document" in msg:
-        doc = msg["document"]
-        mime_type = doc.get("mime_type", "")
-        if mime_type == "application/pdf" or mime_type.startswith("image/"):
-            send_telegram_message(chat_id, "⏳ Lendo comprovante em arquivo...")
-            try:
-                file_bytes = baixar_arquivo_telegram(doc["file_id"])
-                dados = extrair_dados_comprovante(file_bytes, mime_type)
-                resposta = atualizar_planilha(dados.get("voos", []))
-                send_telegram_message(chat_id, resposta)
-            except Exception as e:
-                send_telegram_message(chat_id, f"❌ Erro ao processar arquivo: `{str(e)}`")
-        else:
-            send_telegram_message(chat_id, "⚠️ Formato não suportado. Envie uma *foto/print* ou *PDF* da passagem.")
-
+    if mensagem.get("photo"):
+        file_id = mensagem["photo"][-1]["file_id"]
+        mime_type = "image/jpeg"
+        enviar_mensagem(chat_id, "⏳ Lendo print da passagem...")
+    elif mensagem.get("document"):
+        doc = mensagem["document"]
+        file_id = doc["file_id"]
+        mime_type = doc.get("mime_type") or "application/pdf"
+        enviar_mensagem(chat_id, "⏳ Lendo arquivo da passagem...")
     else:
-        send_telegram_message(chat_id, "📸 Envie o *print* ou o *PDF* da compra da passagem para atualizar a planilha.")
+        enviar_mensagem(chat_id, "Envie um print ou PDF da passagem para registrar na planilha.")
+        return jsonify({"ok": True}), 200
 
-    return "OK", 200
+    try:
+        file_bytes, _ = baixar_arquivo_telegram(file_id)
+        dados, modelo_usado = extrair_dados_comprovante(file_bytes, mime_type)
+        aba_titulo, num_linha = registrar_na_planilha(dados)
+        resumo = (
+            f"✅ Voo registrado com sucesso (modelo: {modelo_usado})\n"
+            f"Aba: {aba_titulo} | Linha: {num_linha}\n"
+            f"Origem: {dados.get('origem', '-')} → Destino: {dados.get('destino', '-')}\n"
+            f"Embarque: {dados.get('data_embarque', '-')} {dados.get('hora_embarque', '')}\n"
+            f"Voo: {dados.get('companhia', '-')} {dados.get('numero_voo', '')}"
+        )
+        enviar_mensagem(chat_id, resumo)
+    except Exception as e:
+        enviar_mensagem(chat_id, f"❌ Erro ao processar print: {e}")
+
+    return jsonify({"ok": True}), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
