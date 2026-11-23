@@ -29,6 +29,7 @@ SHEET_NAME = (os.environ.get("SHEET_NAME", "Voos Embarque x Desembarque") or "Vo
 ALLOWED_CHAT_ID = (os.environ.get("ALLOWED_CHAT_ID", "") or "").strip()
 
 MODELOS_GEMINI = [
+    "gemini-3.6-flash",
     "gemini-3.8-flash",
 ]
 
@@ -95,6 +96,7 @@ def extrair_dados_comprovante(file_bytes, mime_type):
 
     parte_arquivo = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
     ultimo_erro = None
+    teve_quota = False
 
     for modelo in MODELOS_GEMINI:
         for tentativa in range(4):
@@ -114,21 +116,25 @@ def extrair_dados_comprovante(file_bytes, mime_type):
                 msg = str(e)
                 codigo = getattr(e, "code", None)
                 if codigo == 429 or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    teve_quota = True
                     tempo_espera = _extrair_retry_delay(msg)
-                    aviso = "Quota da API Gemini atingida (429 RESOURCE_EXHAUSTED)."
+                    aviso = f"Quota da API Gemini atingida no modelo {modelo} (429 RESOURCE_EXHAUSTED)."
                     if tempo_espera:
                         aviso += f" Aguarde cerca de {tempo_espera} para nova tentativa."
-                    raise QuotaExcedidaError(aviso)
+                    ultimo_erro = QuotaExcedidaError(aviso)
+                    break
+                if codigo == 404 or "404" in msg or "NOT_FOUND" in msg:
+                    break
                 if codigo == 503 or "503" in msg or "UNAVAILABLE" in msg:
                     time.sleep(3 * (tentativa + 1))
                     continue
-                raise
-            except QuotaExcedidaError:
                 raise
             except Exception as e:
                 ultimo_erro = e
                 time.sleep(1)
 
+    if teve_quota and isinstance(ultimo_erro, QuotaExcedidaError):
+        raise ultimo_erro
     raise ultimo_erro if ultimo_erro else RuntimeError("Falha ao consultar o Gemini.")
 
 
