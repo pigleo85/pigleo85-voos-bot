@@ -71,7 +71,7 @@ def extrair_dados_comprovante(file_bytes, mime_type):
     )
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=[conteudo_midia, prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
