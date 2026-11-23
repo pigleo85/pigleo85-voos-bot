@@ -90,8 +90,8 @@ def extrair_dados_comprovante(file_bytes, mime_type):
         "sem blocos markdown, com as chaves: "
         '{"companhia": "", "numero_voo": "", "origem": "", "destino": "", '
         '"data_embarque": "", "hora_embarque": "", "data_chegada": "", "hora_chegada": "", '
-        '"localizador": "", "passageiro": ""}. '
-        "Se algum campo não existir, use string vazia."
+        '"localizador": "", "passageiro": "", "preco": ""}. '
+        "Use DD/MM/AAAA para datas e HH:MM para horários. Se algum campo não existir, use string vazia."
     )
 
     parte_arquivo = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
@@ -138,23 +138,106 @@ def extrair_dados_comprovante(file_bytes, mime_type):
     raise ultimo_erro if ultimo_erro else RuntimeError("Falha ao consultar o Gemini.")
 
 
+def _extrair_iata(texto):
+    if not texto:
+        return ""
+    match = re.search(r"\(([A-Z]{3})\)", texto)
+    if match:
+        return match.group(1)
+    limpo = texto.strip().upper()
+    if len(limpo) == 3 and limpo.isalpha():
+        return limpo
+    return texto.strip()
+
+
+def _formatar_trajeto(origem, destino):
+    cod_orig = _extrair_iata(origem)
+    cod_dest = _extrair_iata(destino)
+    if cod_orig and cod_dest:
+        return f"{cod_orig} x {cod_dest}"
+    return f"{origem} x {destino}".strip(" x")
+
+
+def _normalizar_cia(cia):
+    c = (cia or "").strip()
+    if "gol" in c.lower():
+        return "GOL"
+    return c
+
+
 def registrar_na_planilha(dados):
     planilha = obter_planilha()
-    aba = planilha.sheet1
-    linha = [
-        dados.get("data_embarque", ""),
-        dados.get("hora_embarque", ""),
-        dados.get("origem", ""),
-        dados.get("destino", ""),
-        dados.get("companhia", ""),
-        dados.get("numero_voo", ""),
-        dados.get("localizador", ""),
-        dados.get("passageiro", ""),
-        dados.get("data_chegada", ""),
-        dados.get("hora_chegada", ""),
+    data_emb = (dados.get("data_embarque") or "").strip()
+    ano_match = re.search(r"(\d{4})$", data_emb)
+    ano = ano_match.group(1) if ano_match else ""
+
+    try:
+        aba = planilha.worksheet(ano) if ano else planilha.sheet1
+    except Exception:
+        aba = planilha.sheet1
+
+    # Coluna B (índice 2 em gspread) contém as datas pré-definidas
+    col_datas = aba.col_values(2)
+    linha_alvo = None
+    for idx, valor in enumerate(col_datas, start=1):
+        if (valor or "").strip() == data_emb:
+            linha_alvo = idx
+            break
+
+    trajeto = _formatar_trajeto(dados.get("origem", ""), dados.get("destino", ""))
+    cia = _normalizar_cia(dados.get("companhia", ""))
+    horario = (dados.get("hora_embarque") or "").strip()
+    localizador = (dados.get("localizador") or "").strip().upper()
+    preco = (dados.get("preco") or "").strip()
+    num_voo = (dados.get("numero_voo") or "").strip()
+
+    if linha_alvo:
+        linha_atual = aba.row_values(linha_alvo)
+        while len(linha_atual) < 9:
+            linha_atual.append("")
+
+        obs_atual = linha_atual[8].strip()
+        obs_nova = obs_atual
+        if num_voo and num_voo.lower() not in obs_atual.lower():
+            obs_nova = f"{obs_atual} | Voo {num_voo}".strip(" |") if obs_atual else f"Voo {num_voo}"
+
+        valores_c_a_i = [
+            "Comprada",
+            trajeto or linha_atual[3],
+            cia or linha_atual[4],
+            horario or linha_atual[5],
+            localizador or linha_atual[6],
+            preco or linha_atual[7],
+            obs_nova,
+        ]
+        aba.update(f"C{linha_alvo}:I{linha_alvo}", [valores_c_a_i], value_input_option="USER_ENTERED")
+        return aba.title, linha_alvo
+
+    # Caso a data não exista pré-definida na aba do ano, preenche colunas B:I na primeira linha vazia
+    linha_vazia = None
+    for idx in range(3, len(col_datas) + 1):
+        if not (col_datas[idx - 1] or "").strip():
+            linha_vazia = idx
+            break
+
+    obs_extra = f"Voo {num_voo}" if num_voo else ""
+    valores_b_a_i = [
+        data_emb,
+        "Comprada",
+        trajeto,
+        cia,
+        horario,
+        localizador,
+        preco,
+        obs_extra,
     ]
-    aba.append_row(linha, value_input_option="USER_ENTERED")
-    return aba.title, len(aba.get_all_values())
+    if linha_vazia:
+        aba.update(f"B{linha_vazia}:I{linha_vazia}", [valores_b_a_i], value_input_option="USER_ENTERED")
+        return aba.title, linha_vazia
+
+    nova_linha = len(col_datas) + 1
+    aba.update(f"B{nova_linha}:I{nova_linha}", [valores_b_a_i], value_input_option="USER_ENTERED")
+    return aba.title, nova_linha
 
 
 def baixar_arquivo_telegram(file_id):
@@ -210,9 +293,8 @@ def webhook():
         resumo = (
             f"✅ Voo registrado com sucesso (modelo: {modelo_usado})\n"
             f"Aba: {aba_titulo} | Linha: {num_linha}\n"
-            f"Origem: {dados.get('origem', '-')} → Destino: {dados.get('destino', '-')}\n"
-            f"Embarque: {dados.get('data_embarque', '-')} {dados.get('hora_embarque', '')}\n"
-            f"Voo: {dados.get('companhia', '-')} {dados.get('numero_voo', '')}"
+            f"Data: {dados.get('data_embarque', '-')} | Horário: {dados.get('hora_embarque', '-')}\n"
+            f"Trajeto: {_formatar_trajeto(dados.get('origem', ''), dados.get('destino', ''))} | Localizador: {dados.get('localizador', '-')}"
         )
         enviar_mensagem(chat_id, resumo)
     except QuotaExcedidaError as e:
