@@ -30,7 +30,6 @@ ALLOWED_CHAT_ID = (os.environ.get("ALLOWED_CHAT_ID", "") or "").strip()
 
 MODELOS_GEMINI = [
     "gemini-3.8-flash",
-    "gemini-2.5-flash",
 ]
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else genai.Client()
@@ -77,7 +76,7 @@ def extrair_dados_comprovante(file_bytes, mime_type):
     ultimo_erro = None
 
     for modelo in MODELOS_GEMINI:
-        for tentativa in range(3):
+        for tentativa in range(5):
             try:
                 response = client.models.generate_content(
                     model=modelo,
@@ -93,7 +92,7 @@ def extrair_dados_comprovante(file_bytes, mime_type):
                 ultimo_erro = e
                 msg = str(e)
                 if getattr(e, "code", None) == 503 or "503" in msg or "UNAVAILABLE" in msg:
-                    time.sleep(2 * (tentativa + 1))
+                    time.sleep(3 * (tentativa + 1))
                     continue
                 raise
             except Exception as e:
