@@ -87,10 +87,6 @@ def _extrair_retry_delay(msg):
     return None
 
 
-class QuotaExcedidaError(Exception):
-    pass
-
-
 def extrair_dados_comprovante(file_bytes, mime_type):
     prompt = (
         "Analise este comprovante ou passagem aérea e extraia os dados do voo em JSON puro, "
@@ -102,8 +98,7 @@ def extrair_dados_comprovante(file_bytes, mime_type):
     )
 
     parte_arquivo = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
-    ultimo_erro = None
-    teve_quota = False
+    erros_por_modelo = []
 
     for modelo in MODELOS_GEMINI:
         for tentativa in range(2):
@@ -119,32 +114,32 @@ def extrair_dados_comprovante(file_bytes, mime_type):
                         texto = "\n".join(linhas[1:-1]).strip()
                 return json.loads(texto), modelo
             except APIError as e:
-                ultimo_erro = e
                 msg = str(e)
                 codigo = getattr(e, "code", None)
                 if codigo == 429 or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    teve_quota = True
                     tempo_espera = _extrair_retry_delay(msg)
-                    aviso = f"Quota da API Gemini atingida no modelo {modelo} (429 RESOURCE_EXHAUSTED)."
+                    detalhe = "429 RESOURCE_EXHAUSTED"
                     if tempo_espera:
-                        aviso += f" Aguarde cerca de {tempo_espera} para nova tentativa."
-                    ultimo_erro = QuotaExcedidaError(aviso)
+                        detalhe += f" (aguarde ~{tempo_espera})"
+                    erros_por_modelo.append(f"• {modelo}: {detalhe}")
                     break
                 if codigo == 404 or "404" in msg or "NOT_FOUND" in msg:
+                    erros_por_modelo.append(f"• {modelo}: 404 NOT_FOUND")
                     break
                 if codigo == 503 or "503" in msg or "UNAVAILABLE" in msg:
                     if tentativa == 0:
                         time.sleep(2)
                         continue
+                    erros_por_modelo.append(f"• {modelo}: 503 UNAVAILABLE")
                     break
-                raise
+                erros_por_modelo.append(f"• {modelo}: {msg[:120]}")
+                break
             except Exception as e:
-                ultimo_erro = e
+                erros_por_modelo.append(f"• {modelo}: {str(e)[:120]}")
                 break
 
-    if teve_quota and isinstance(ultimo_erro, QuotaExcedidaError):
-        raise ultimo_erro
-    raise ultimo_erro if ultimo_erro else RuntimeError("Falha ao consultar o Gemini.")
+    resumo_erros = "\n".join(erros_por_modelo) if erros_por_modelo else "Nenhum modelo respondeu."
+    raise RuntimeError(f"Falha em todos os modelos Gemini:\n{resumo_erros}")
 
 
 def _extrair_iata(texto):
@@ -292,10 +287,8 @@ def _processar_em_background(chat_id, file_id, mime_type):
             f"Trajeto: {_formatar_trajeto(dados.get('origem', ''), dados.get('destino', ''))} | Localizador: {dados.get('localizador', '-')}"
         )
         enviar_mensagem(chat_id, resumo)
-    except QuotaExcedidaError as e:
-        enviar_mensagem(chat_id, f"⚠️ {e}")
     except Exception as e:
-        enviar_mensagem(chat_id, f"❌ Erro ao processar print: {e}")
+        enviar_mensagem(chat_id, f"❌ Erro ao processar print:\n{e}")
 
 
 @app.route("/", methods=["GET", "HEAD"])
