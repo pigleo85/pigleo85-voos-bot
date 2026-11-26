@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import threading
 import time
+from collections import deque
 import requests
 from flask import Flask, request, jsonify
 import gspread
@@ -29,11 +31,16 @@ SHEET_NAME = (os.environ.get("SHEET_NAME", "Voos Embarque x Desembarque") or "Vo
 ALLOWED_CHAT_ID = (os.environ.get("ALLOWED_CHAT_ID", "") or "").strip()
 
 MODELOS_GEMINI = [
+    "gemini-2.5-flash",
     "gemini-3.6-flash",
     "gemini-3.8-flash",
 ]
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else genai.Client()
+
+# Controle em memória para evitar reprocessamento de mensagens duplicadas do Telegram
+UPDATES_PROCESSADOS = deque(maxlen=200)
+LOCK_UPDATES = threading.Lock()
 
 
 def enviar_mensagem(chat_id, texto):
@@ -99,7 +106,7 @@ def extrair_dados_comprovante(file_bytes, mime_type):
     teve_quota = False
 
     for modelo in MODELOS_GEMINI:
-        for tentativa in range(4):
+        for tentativa in range(2):
             try:
                 response = client.models.generate_content(
                     model=modelo,
@@ -126,12 +133,14 @@ def extrair_dados_comprovante(file_bytes, mime_type):
                 if codigo == 404 or "404" in msg or "NOT_FOUND" in msg:
                     break
                 if codigo == 503 or "503" in msg or "UNAVAILABLE" in msg:
-                    time.sleep(3 * (tentativa + 1))
-                    continue
+                    if tentativa == 0:
+                        time.sleep(2)
+                        continue
+                    break
                 raise
             except Exception as e:
                 ultimo_erro = e
-                time.sleep(1)
+                break
 
     if teve_quota and isinstance(ultimo_erro, QuotaExcedidaError):
         raise ultimo_erro
@@ -176,7 +185,6 @@ def registrar_na_planilha(dados):
     except Exception:
         aba = planilha.sheet1
 
-    # Coluna B (índice 2 em gspread) contém as datas pré-definidas
     col_datas = aba.col_values(2)
     linha_alvo = None
     for idx, valor in enumerate(col_datas, start=1):
@@ -213,7 +221,6 @@ def registrar_na_planilha(dados):
         aba.update(f"C{linha_alvo}:I{linha_alvo}", [valores_c_a_i], value_input_option="USER_ENTERED")
         return aba.title, linha_alvo
 
-    # Caso a data não exista pré-definida na aba do ano, preenche colunas B:I na primeira linha vazia
     linha_vazia = None
     for idx in range(3, len(col_datas) + 1):
         if not (col_datas[idx - 1] or "").strip():
@@ -244,14 +251,51 @@ def baixar_arquivo_telegram(file_id):
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN inválido ou vazio.")
     info_url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}/getFile"
-    info_resp = requests.get(info_url, params={"file_id": file_id}, timeout=20)
-    info_resp.raise_for_status()
+    try:
+        info_resp = requests.get(info_url, params={"file_id": file_id}, timeout=20)
+        info_resp.raise_for_status()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "erro"
+        if status == 400:
+            raise ValueError(
+                "Não foi possível baixar o arquivo pelo bot de passagens (400 Bad Request). "
+                "Verifique se o print foi enviado direto no chat 'Controle de Voos'."
+            )
+        raise RuntimeError(f"Falha ao consultar arquivo no Telegram (HTTP {status}).")
+    except requests.RequestException:
+        raise RuntimeError("Falha de rede ao consultar arquivo no Telegram.")
+
     info_json = info_resp.json()
     file_path = info_json["result"]["file_path"].lstrip("/")
     file_url = f"{TELEGRAM_API_BASE}/file/bot{TELEGRAM_TOKEN}/{file_path}"
-    file_resp = requests.get(file_url, timeout=30)
-    file_resp.raise_for_status()
+    try:
+        file_resp = requests.get(file_url, timeout=30)
+        file_resp.raise_for_status()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "erro"
+        raise RuntimeError(f"Falha ao baixar arquivo do Telegram (HTTP {status}).")
+    except requests.RequestException:
+        raise RuntimeError("Falha de rede ao baixar arquivo do Telegram.")
+
     return file_resp.content, file_path
+
+
+def _processar_em_background(chat_id, file_id, mime_type):
+    try:
+        file_bytes, _ = baixar_arquivo_telegram(file_id)
+        dados, modelo_usado = extrair_dados_comprovante(file_bytes, mime_type)
+        aba_titulo, num_linha = registrar_na_planilha(dados)
+        resumo = (
+            f"✅ Voo registrado com sucesso (modelo: {modelo_usado})\n"
+            f"Aba: {aba_titulo} | Linha: {num_linha}\n"
+            f"Data: {dados.get('data_embarque', '-')} | Horário: {dados.get('hora_embarque', '-')}\n"
+            f"Trajeto: {_formatar_trajeto(dados.get('origem', ''), dados.get('destino', ''))} | Localizador: {dados.get('localizador', '-')}"
+        )
+        enviar_mensagem(chat_id, resumo)
+    except QuotaExcedidaError as e:
+        enviar_mensagem(chat_id, f"⚠️ {e}")
+    except Exception as e:
+        enviar_mensagem(chat_id, f"❌ Erro ao processar print: {e}")
 
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -262,6 +306,14 @@ def home():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
+    update_id = data.get("update_id")
+
+    if update_id is not None:
+        with LOCK_UPDATES:
+            if update_id in UPDATES_PROCESSADOS:
+                return jsonify({"ok": True}), 200
+            UPDATES_PROCESSADOS.append(update_id)
+
     mensagem = data.get("message") or data.get("edited_message")
     if not mensagem:
         return jsonify({"ok": True}), 200
@@ -286,21 +338,12 @@ def webhook():
         enviar_mensagem(chat_id, "Envie um print ou PDF da passagem para registrar na planilha.")
         return jsonify({"ok": True}), 200
 
-    try:
-        file_bytes, _ = baixar_arquivo_telegram(file_id)
-        dados, modelo_usado = extrair_dados_comprovante(file_bytes, mime_type)
-        aba_titulo, num_linha = registrar_na_planilha(dados)
-        resumo = (
-            f"✅ Voo registrado com sucesso (modelo: {modelo_usado})\n"
-            f"Aba: {aba_titulo} | Linha: {num_linha}\n"
-            f"Data: {dados.get('data_embarque', '-')} | Horário: {dados.get('hora_embarque', '-')}\n"
-            f"Trajeto: {_formatar_trajeto(dados.get('origem', ''), dados.get('destino', ''))} | Localizador: {dados.get('localizador', '-')}"
-        )
-        enviar_mensagem(chat_id, resumo)
-    except QuotaExcedidaError as e:
-        enviar_mensagem(chat_id, f"⚠️ {e}")
-    except Exception as e:
-        enviar_mensagem(chat_id, f"❌ Erro ao processar print: {e}")
+    thread = threading.Thread(
+        target=_processar_em_background,
+        args=(chat_id, file_id, mime_type),
+        daemon=True,
+    )
+    thread.start()
 
     return jsonify({"ok": True}), 200
 
